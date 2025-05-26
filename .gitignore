@@ -26,6 +26,11 @@ pytest_cache/
 coverage.xml
 htmlcov/
 
+# IDE specific files
+.idea/
+.vscode/
+
+
 # Virtual Environment
 venv/
 ENV/
