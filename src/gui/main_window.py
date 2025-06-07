@@ -6,6 +6,9 @@ from src.utils.photo_operations import PhotoHandler
 import os
 import shutil
 import threading
+import concurrent.futures
+from functools import partial
+
 
 
 class PhotoMoverApp:
@@ -220,20 +223,51 @@ class PhotoMoverApp:
         tree = event.widget
         item = tree.focus()
 
-        # Store existing tags before clearing children
-        stored_tags = self._store_item_tags(tree, item)
+        # Check if item still exists
+        try:
+            # Verify the item exists before proceeding
+            if not item or not tree.exists(item):
+                return
 
-        # Clear and repopulate children
-        children = tree.get_children(item)
-        if children:
-            tree.delete(*children)
+            # Store existing tags before clearing children
+            stored_tags = self._store_item_tags(tree, item)
 
-        path = tree.item(item)['values'][0]
-        if path:
-            self._populate_tree(tree, path, item)
+            # Check if item still exists after storing tags
+            if not tree.exists(item):
+                return
 
-        # Restore tags after repopulating
-        self._restore_item_tags(tree, stored_tags)
+            # Get children safely
+            try:
+                children = tree.get_children(item)
+            except tk.TclError:
+                return
+
+            # Clear children if they exist
+            if children:
+                try:
+                    tree.delete(*children)
+                except tk.TclError:
+                    # If some children were already deleted, ignore the error
+                    pass
+
+            # Check if item still exists before getting values
+            if not tree.exists(item):
+                return
+
+            try:
+                path = tree.item(item)['values'][0]
+                if path:
+                    self._populate_tree(tree, path, item)
+
+                # Restore tags only if item still exists
+                if tree.exists(item):
+                    self._restore_item_tags(tree, stored_tags)
+            except (tk.TclError, IndexError):
+                pass
+
+        except tk.TclError:
+            # Handle any remaining Tcl errors
+            pass
 
     def refresh_dest_folders(self):
         """Refresh the destination folders tree"""
@@ -314,10 +348,17 @@ class PhotoMoverApp:
         elif has_renamed:
             self.update_item_color(self.source_tree, folder_item, 'renamed')
 
-    def update_progress(self, current_file, processed_count, total_files):
-        """Update progress bar and current file label"""
+    def update_progress(self, current_file, processed_count, total_files, current_item):
+        """Update progress bar, current file label and scroll to current item"""
         self.current_file.set(f"Processing: {os.path.basename(current_file)}")
         self.progress_var.set((processed_count / total_files) * 100)
+        if current_item:
+            self.scroll_to_item(self.source_tree, current_item)
+        self.root.update()
+
+    def scroll_to_item(self, tree, item):
+        """Ensure the specified item is visible in the tree"""
+        tree.see(item)
         self.root.update()
 
     def stop_processing(self):
@@ -350,7 +391,7 @@ class PhotoMoverApp:
         self.refresh_dest_folders()
 
     def process_files(self):
-        """Process files in a separate thread"""
+        """Process files in a separate thread with parallel processing"""
         selected_items = self.source_tree.selection()
         if not selected_items:
             messagebox.showwarning("No Selection", "Please select a source folder")
@@ -367,43 +408,67 @@ class PhotoMoverApp:
         movies = []
         other_files = []
 
-        def collect_files(folder_path, current_tree_item):
+        # Use ThreadPoolExecutor for parallel file collection
+        def collect_file(entry, current_tree_item):
+            if entry.name.startswith('$') or entry.name.startswith('.'):
+                return None
+
+            # Create tree item if it doesn't exist
+            entry_item = None
+            for child in self.source_tree.get_children(current_tree_item):
+                child_name = self.source_tree.item(child, 'text')
+                if child_name == entry.name:
+                    entry_item = child
+                    break
+
+            if not entry_item:
+                entry_item = self.source_tree.insert(current_tree_item, 'end',
+                                                     text=entry.name,
+                                                     values=(entry.path,))
+
+            if entry.is_file():
+                if self.photo_handler.is_image_file(entry.name):
+                    return ('photo', entry.path, entry_item)
+                elif self.photo_handler.is_movie_file(entry.name):
+                    return ('movie', entry.path, entry_item)
+                else:
+                    return ('other', entry.path, entry_item)
+            return None
+
+        def collect_files_parallel(folder_path, current_tree_item):
             try:
-                for entry in os.scandir(folder_path):
-                    if entry.name.startswith('$') or entry.name.startswith('.'):
-                        continue
+                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                    entries = list(os.scandir(folder_path))
+                    collect_func = partial(collect_file, current_tree_item=current_tree_item)
+                    results = list(executor.map(collect_func, entries))
 
-                    # Create tree item if it doesn't exist
-                    entry_item = None
-                    for child in self.source_tree.get_children(current_tree_item):
-                        child_name = self.source_tree.item(child, 'text')
-                        if child_name == entry.name:
-                            entry_item = child
-                            break
+                    for result in results:
+                        if result:
+                            file_type, path, item = result
+                            if file_type == 'photo':
+                                photos.append((path, item))
+                            elif file_type == 'movie':
+                                movies.append((path, item))
+                            else:
+                                other_files.append((path, item))
 
-                    if not entry_item:
-                        # Create new tree item
-                        entry_item = self.source_tree.insert(current_tree_item, 'end',
-                                                             text=entry.name,
-                                                             values=(entry.path,))
-
-                    if entry.is_file():
-                        if self.photo_handler.is_image_file(entry.name):
-                            photos.append((entry.path, entry_item))
-                        elif self.photo_handler.is_movie_file(entry.name):
-                            movies.append((entry.path, entry_item))
-                        else:
-                            other_files.append((entry.path, entry_item))
-                    elif entry.is_dir():
-                        # Recursively process subdirectories
-                        collect_files(entry.path, entry_item)
+                    # Process subdirectories
+                    subdirs = [entry for entry in entries if entry.is_dir()]
+                    for subdir in subdirs:
+                        try:
+                            collect_files_parallel(subdir.path,
+                                                   self.source_tree.insert(current_tree_item, 'end',
+                                                                           text=subdir.name,
+                                                                           values=(subdir.path,)))
+                        except PermissionError:
+                            continue
 
             except PermissionError:
                 messagebox.showerror("Error", f"Access denied to {folder_path}")
             except Exception as e:
                 messagebox.showerror("Error", f"Error accessing {folder_path}: {str(e)}")
 
-        collect_files(source_path, selected_item)
+        collect_files_parallel(source_path, selected_item)
 
         if not (photos or movies or other_files):
             messagebox.showwarning("No Files", "No files found to process")
@@ -415,26 +480,23 @@ class PhotoMoverApp:
             return
 
         base_dest_path = self.dest_tree.item(dest_selection[0])['values'][0]
-
         self.progress_var.set(0)
         total_files = len(photos) + len(movies) + len(other_files)
+        processed_count = 0
 
         self.processing = True
         self.move_btn.configure(state='disabled')
         self.stop_btn.configure(state='normal')
 
-        processed_count = 0
-
-        # Process photos
-        for src_path, tree_item in photos:
+        # Process files in parallel
+        def process_photo(args):
             if not self.processing:
-                break
-
+                return None
+            src_path, tree_item = args
             try:
                 photo_date = self.photo_handler.get_photo_date(src_path)
                 year_folder = str(photo_date.year)
                 month_folder = f"{photo_date.month:02d}"
-
                 year_path = os.path.join(base_dest_path, year_folder)
                 month_path = os.path.join(year_path, month_folder)
 
@@ -447,80 +509,63 @@ class PhotoMoverApp:
                 if os.path.exists(dest_file):
                     if src_filename == os.path.basename(dest_file) and self.photo_handler.are_images_same(src_path,
                                                                                                           dest_file):
-                        self.update_item_color(self.source_tree, tree_item, 'duplicate')
-                        continue
+                        return ('duplicate', src_path, tree_item)
                     elif self.photo_handler.are_images_same(src_path, dest_file):
-                        self.update_item_color(self.source_tree, tree_item, 'copied')
-                        continue
+                        return ('copied', src_path, tree_item)
                     else:
                         dest_file = self.get_unique_filename(dest_file)
-                        self.update_item_color(self.source_tree, tree_item, 'renamed')
+                        shutil.copy2(src_path, dest_file)
+                        return ('renamed', src_path, tree_item)
 
                 shutil.copy2(src_path, dest_file)
-                self.update_item_color(self.source_tree, tree_item, 'copied')
-
+                return ('copied', src_path, tree_item)
             except Exception as e:
-                messagebox.showerror("Error", f"Error processing {src_path}: {str(e)}")
-                self.update_item_color(self.source_tree, tree_item, 'pending')
-                continue
+                return ('error', src_path, tree_item)
 
-            processed_count += 1
-            self.update_progress(src_path, processed_count, total_files)
-
-        # Process movies
-        movies_folder = os.path.join(base_dest_path, "Movies")
-        os.makedirs(movies_folder, exist_ok=True)
-
-        for src_path, tree_item in movies:
+        def process_other_file(args, folder_name):
             if not self.processing:
-                break
-
+                return None
+            src_path, tree_item = args
             try:
-                dest_file = os.path.join(movies_folder, os.path.basename(src_path))
+                dest_folder = os.path.join(base_dest_path, folder_name)
+                os.makedirs(dest_folder, exist_ok=True)
+                dest_file = os.path.join(dest_folder, os.path.basename(src_path))
+
                 if os.path.exists(dest_file):
                     dest_file = self.get_unique_filename(dest_file)
-                    self.update_item_color(self.source_tree, tree_item, 'renamed')
-                else:
-                    self.update_item_color(self.source_tree, tree_item, 'copied')
+                    shutil.copy2(src_path, dest_file)
+                    return ('renamed', src_path, tree_item)
 
                 shutil.copy2(src_path, dest_file)
-
+                return ('copied', src_path, tree_item)
             except Exception as e:
-                messagebox.showerror("Error", f"Error processing {src_path}: {str(e)}")
-                self.update_item_color(self.source_tree, tree_item, 'pending')
-                continue
+                return ('error', src_path, tree_item)
 
-            processed_count += 1
-            self.update_progress(src_path, processed_count, total_files)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            # Process photos
+            photo_futures = [executor.submit(process_photo, photo) for photo in photos]
 
-        # Process other files
-        other_folder = os.path.join(base_dest_path, "Other")
-        os.makedirs(other_folder, exist_ok=True)
+            # Process movies and other files
+            movie_futures = [executor.submit(process_other_file, movie, "Movies")
+                             for movie in movies]
+            other_futures = [executor.submit(process_other_file, other, "Other")
+                             for other in other_files]
 
-        for src_path, tree_item in other_files:
-            if not self.processing:
-                break
+            all_futures = photo_futures + movie_futures + other_futures
 
-            try:
-                dest_file = os.path.join(other_folder, os.path.basename(src_path))
-                if os.path.exists(dest_file):
-                    dest_file = self.get_unique_filename(dest_file)
-                    self.update_item_color(self.source_tree, tree_item, 'renamed')
-                else:
-                    self.update_item_color(self.source_tree, tree_item, 'copied')
+            for future in concurrent.futures.as_completed(all_futures):
+                if not self.processing:
+                    executor.shutdown(wait=False)
+                    break
 
-                shutil.copy2(src_path, dest_file)
-
-            except Exception as e:
-                messagebox.showerror("Error", f"Error processing {src_path}: {str(e)}")
-                self.update_item_color(self.source_tree, tree_item, 'pending')
-                continue
-
-            processed_count += 1
-            self.update_progress(src_path, processed_count, total_files)
+                result = future.result()
+                if result:
+                    status, src_path, tree_item = result
+                    self.update_item_color(self.source_tree, tree_item, status)
+                    processed_count += 1
+                    self.update_progress(src_path, processed_count, total_files, tree_item)
 
         self.update_folder_status(selected_item)
-
         self.current_file.set("Processing complete" if self.processing else "Processing stopped")
         self.stop_btn.configure(state='disabled')
         self.move_btn.configure(state='normal')
